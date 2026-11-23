@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>VTuber Avatar</title>
+<style>
+  html, body { margin:0; height:100%; background:#111; color:#eee; font-family:sans-serif; overflow:hidden; }
+  #app { display:flex; flex-direction:column; height:100%; }
+  #cv { flex:1; width:100%; min-height:0; object-fit:contain; background:#fff; }
+  #bar { display:flex; gap:8px; padding:8px; background:#222; }
+  button { flex:1; padding:12px; border:0; border-radius:12px; font-size:16px;
+           background:#2aa198; color:#fff; }
+  button.off { background:#555; }
+  #status { position:absolute; top:12px; left:12px; background:#0008;
+            padding:8px 12px; border-radius:8px; font-size:14px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <video id="cam" playsinline muted style="display:none"></video>
+  <canvas id="cv"></canvas>
+  <div id="status">Загрузка моделей… (нужен интернет при первом запуске)</div>
+  <div id="bar">
+    <button id="bowBtn">Бантик</button>
+    <button id="recBtn">Запись</button>
+  </div>
+</div>
+
+<script type="module">
+import { FilesetResolver, FaceLandmarker, PoseLandmarker, HandLandmarker } from
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const FACE_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const POSE_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+const HAND_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+const video  = document.getElementById("cam");
+const canvas = document.getElementById("cv");
+const ctx    = canvas.getContext("2d");
+const status = document.getElementById("status");
+
+// ---------- Состояние ----------
+let showBow = false;
+let mouthState = "closed";
+let eyesState = "open";
+let mouthRatioSmooth = null;
+const posePrev = {};
+const OPEN_HALF = 0.06, OPEN_FULL = 0.12, SWITCH_MARGIN = 0.015;
+
+// ---------- Кнопки ----------
+const bowBtn = document.getElementById("bowBtn");
+bowBtn.onclick = () => { showBow = !showBow; bowBtn.classList.toggle("off", !showBow); };
+
+let recorder = null, chunks = [];
+const recBtn = document.getElementById("recBtn");
+recBtn.onclick = toggleRec;
+
+async function toggleRec() {
+  if (recorder) { recorder.stop(); return; }
+  const stream = canvas.captureStream(30);
+  try {
+    const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mic.getAudioTracks().forEach(t => stream.addTrack(t));
+  } catch (e) { /* пишем без звука */ }
+  chunks = [];
+  recorder = new MediaRecorder(stream, { mimeType: "video/webm" });
+  recorder.ondataavailable = e => chunks.push(e.data);
+  recorder.onstop = () => {
+    const url = URL.createObjectURL(new Blob(chunks, { type: "video/webm" }));
+    const a = document.createElement("a");
+    a.href = url; a.download = "vtuber_" + Date.now() + ".webm"; a.click();
+    recorder = null;
+    recBtn.textContent = "Запись";
+    recBtn.classList.remove("off");
+  };
+  recorder.start();
+  recBtn.textContent = "Стоп";
+  recBtn.classList.add("off");
+}
+
+// ---------- Математика ----------
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+function smoothPoint(i, raw) {
+  const prev = posePrev[i];
+  const sm = prev ? { x: prev.x * 0.5 + raw.x * 0.5, y: prev.y * 0.5 + raw.y * 0.5 } : raw;
+  posePrev[i] = sm;
+  return sm;
+}
+
+// ---------- Рисование ----------
+function capsule(a, b, width, color) {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = Math.max(width, 2);
+  ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+}
+
+function drawBow(cx, cy, size, tilt) {
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(tilt);
+  ctx.fillStyle = "#ff5fa2";
+  const s = size;
+  // два лепестка
+  ctx.beginPath(); ctx.ellipse(-s * 0.45, 0, s * 0.45, s * 0.3, -0.4, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.ellipse( s * 0.45, 0, s * 0.45, s * 0.3,  0.4, 0, 7); ctx.fill();
+  // узел
+  ctx.fillStyle = "#ff8fc0";
+  ctx.beginPath(); ctx.arc(0, 0, s * 0.22, 0, 7); ctx.fill();
+  ctx.restore();
+}
+
+function drawFace(fm, w, h) {
+  const P = i => ({ x: fm[i].x * w, y: fm[i].y * h });
+  const nose = P(1);
+  const faceW = dist(P(234), P(454));
+  if (faceW < 25) return;
+
+  const eL = { x: (P(33).x + P(133).x) / 2, y: (P(159).y + P(145).y) / 2 };
+  const eR = { x: (P(263).x + P(362).x) / 2, y: (P(386).y + P(374).y) / 2 };
+  const headCx = (eL.x + eR.x) / 2;
+  const headCy = (eL.y + eR.y) / 2 + faceW * 0.15;
+  const R = faceW * 0.95;
+
+  // голова
+  ctx.fillStyle = "#f7c9a2";
+  ctx.beginPath(); ctx.arc(headCx, headCy, R, 0, 7); ctx.fill();
+  // волосы
+  ctx.fillStyle = "#6b4a2f";
+  ctx.beginPath();
+  ctx.arc(headCx, headCy, R, Math.PI * 1.05, Math.PI * 1.95);
+  ctx.quadraticCurveTo(headCx, headCy - R * 0.55, headCx, headCy - R * 0.55);
+  ctx.fill();
+
+  // глаза
+  const lOpen = dist(P(159), P(145)) / Math.max(dist(P(33), P(133)), 5) >= 0.13;
+  const rOpen = dist(P(386), P(374)) / Math.max(dist(P(263), P(362)), 5) >= 0.13;
+  if (eyesState === "open" && (!lOpen || !rOpen)) eyesState = "closed";
+  else if (eyesState === "closed" && lOpen && rOpen) eyesState = "open";
+
+  const eyeR = faceW * 0.13;
+  for (const e of [eL, eR]) {
+    if (eyesState === "open") {
+      ctx.fillStyle = "#fff";
+      ctx.beginPath(); ctx.ellipse(e.x, e.y, eyeR, eyeR * 1.15, 0, 0, 7); ctx.fill();
+      ctx.fillStyle = "#222";
+      ctx.beginPath(); ctx.arc(e.x, e.y, eyeR * 0.45, 0, 7); ctx.fill();
+    } else {
+      ctx.strokeStyle = "#222"; ctx.lineWidth = eyeR * 0.4; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(e.x - eyeR, e.y); ctx.lineTo(e.x + eyeR, e.y); ctx.stroke();
+    }
+  }
+
+  // рот: сглаживание + гистерезис (как в питоне)
+  const mr = dist(P(13), P(14)) / faceW;
+  mouthRatioSmooth = mouthRatioSmooth === null ? mr : mouthRatioSmooth * 0.85 + mr * 0.15;
+  const r = mouthRatioSmooth, cur = mouthState;
+  if (cur === "closed" && r > OPEN_HALF + SWITCH_MARGIN) mouthState = "half";
+  else if (cur === "half" && r > OPEN_FULL + SWITCH_MARGIN) mouthState = "open";
+  else if (cur === "half" && r < OPEN_HALF - SWITCH_MARGIN) mouthState = "closed";
+  else if (cur === "open" && r < OPEN_FULL - SWITCH_MARGIN) mouthState = "half";
+
+  const mc = { x: (P(61).x + P(291).x) / 2, y: (P(61).y + P(291).y) / 2 };
+  const mw = dist(P(61), P(291)) * 0.9;
+  ctx.fillStyle = "#a33";
+  ctx.strokeStyle = "#7a1f2b"; ctx.lineWidth = mw * 0.06; ctx.lineCap = "round";
+  ctx.beginPath();
+  if (mouthState === "closed") {
+    ctx.moveTo(mc.x - mw / 2, mc.y); ctx.lineTo(mc.x + mw / 2, mc.y);
+    ctx.stroke();
+  } else {
+    const mh = mouthState === "half" ? mw * 0.25 : mw * 0.55;
+    ctx.ellipse(mc.x, mc.y, mw / 2, mh, 0, 0, Math.PI);
+    ctx.fill(); ctx.stroke();
+  }
+
+  // бантик
+  if (showBow) {
+    const tilt = Math.atan2(eR.y - eL.y, eR.x - eL.x) * 0.4;
+    drawBow(headCx + R * 0.55, headCy - R * 0.75, faceW * 0.42, tilt);
+  }
+}
+
+function drawPose(pm, w, h, haveFace) {
+  if (!pm) return;
+  const P = i => smoothPoint(i, { x: pm[i].x * w, y: pm[i].y * h });
+  const lSh = P(11), rSh = P(12), lHip = P(23), rHip = P(24);
+  const lEl = P(13), rEl = P(14), lWr = P(15), rWr = P(16);
+  const sw = dist(lSh, rSh);
+  if (sw < 40) return;
+  const shMid = { x: (lSh.x + rSh.x) / 2, y: (lSh.y + rSh.y) / 2 };
+  const hipMid = { x: (lHip.x + rHip.x) / 2, y: (lHip.y + rHip.y) / 2 };
+
+  // туловище и шея — позади головы, рисуем первыми
+  capsule(shMid, hipMid, sw * 2.2, "#4a90d9");
+  const nosePose = P(0);
+  capsule(shMid, { x: nosePose.x, y: nosePose.y + sw * 0.1 }, sw * 0.7, "#f7c9a2");
+
+  // руки
+  capsule(lSh, lEl, sw * 0.45, "#4a90d9");
+  capsule(rSh, rEl, sw * 0.45, "#4a90d9");
+  capsule(lEl, lWr, sw * 0.38, "#4a90d9");
+  capsule(rEl, rWr, sw * 0.38, "#4a90d9");
+  // кисти
+  ctx.fillStyle = "#f7c9a2";
+  for (const wr of [lWr, rWr]) {
+    ctx.beginPath(); ctx.arc(wr.x, wr.y, sw * 0.35, 0, 7); ctx.fill();
+  }
+}
+
+// ---------- Инициализация ----------
+let faceLm, poseLm, handLm;
+let lastVideoTime = -1;
+let faceRes, poseRes, handRes;
+
+async function setup() {
+  const files = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+
+  faceLm = await FaceLandmarker.createFromOptions(files, {
+    baseOptions: { modelAssetPath: FACE_URL, delegate: "GPU" },
+    runningMode: "VIDEO", numFaces: 1 });
+  poseLm = await PoseLandmarker.createFromOptions(files, {
+    baseOptions: { modelAssetPath: POSE_URL, delegate: "GPU" },
+    runningMode: "VIDEO", numPoses: 1 });
+  handLm = await HandLandmarker.createFromOptions(files, {
+    baseOptions: { modelAssetPath: HAND_URL, delegate: "GPU" },
+    runningMode: "VIDEO", numHands: 2 });
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "user" } });
+  video.srcObject = stream;
+  await video.play();
+
+  status.textContent = "";
+  requestAnimationFrame(loop);
+}
+
+function loop() {
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+
+    const w = video.videoWidth, h = video.videoHeight;
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+
+    const ts = performance.now();
+    faceRes = faceLm.detectForVideo(video, ts);
+    poseRes = poseLm.detectForVideo(video, ts);
+    handRes = handLm.detectForVideo(video, ts);
+
+    // Белый фон + зеркалим (как селфи-камера)
+    ctx.save();
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, w, h);
+    ctx.translate(w, 0); ctx.scale(-1, 1);
+
+    const haveFace = faceRes.faceLandmarks && faceRes.faceLandmarks.length > 0;
+    drawPose(poseRes.landmarks ? poseRes.landmarks[0] : null, w, h, haveFace);
+    if (haveFace) drawFace(faceRes.faceLandmarks[0], w, h);
+
+    // кисти-скелеты: ладонь-кружок + пальцы
+    if (handRes.landmarks) {
+      for (const hm of handRes.landmarks) {
+        const Q = i => ({ x: hm[i].x * w, y: hm[i].y * h });
+        const wrist = Q(0), idx = Q(5), pky = Q(17);
+        const palmW = dist(idx, pky);
+        if (palmW < 12) continue;
+        ctx.fillStyle = "#f7c9a2";
+        const pc = { x: (idx.x + pky.x) / 2, y: (Q(9).y + wrist.y) / 2 };
+        ctx.beginPath(); ctx.arc(pc.x, pc.y, palmW * 1.6, 0, 7); ctx.fill();
+        ctx.strokeStyle = "#f7c9a2";
+        const fingers = [[1,2,3,4],[5,6,7,8],[9,10,11,12],[13,14,15,16],[17,18,19,20]];
+        for (const [a,b,c,d] of fingers) {
+          capsule(Q(a), Q(b), palmW * 0.5, "#f7c9a2");
+          capsule(Q(b), Q(c), palmW * 0.45, "#f7c9a2");
+          capsule(Q(c), Q(d), palmW * 0.4, "#f7c9a2");
+        }
+      }
+    }
+    ctx.restore();
+  }
+  requestAnimationFrame(loop);
+}
+
+setup().catch(e => { status.textContent = "Ошибка: " + e.message; });
+</script>
+</body>
+</html>
